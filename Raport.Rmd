@@ -1,0 +1,174 @@
+---
+title: "Raport - life expectancy"
+author: "Jan Hałasiński"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Projekt z przedmiotu: Eksploracja masywnych danych
+date: "`r Sys.Date()`"
+
+#### Wykorzystane pakiety:
+```{r message=FALSE}
+library(knitr)
+library(pastecs)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(caret)
+library(sgd)
+```
+
+## Podsumowanie Analizy
+
+Na podstawie obserwacji oraz wykonanych analiz nasuwają się wnioski, że oczekiwana długość życia zależy w największym stopniu od bogactwa społeczeństwa. Najbardziej znaczącym parametrem okazała się śmiertelność dorosłych. Ponieważ jeśli długość życia zależy W dużej mierze od przeżywalności dorosłych, to znaczy, że śmiertelność wśród dzieci ma tu mały wpływ. Potwierdzają to uzyskane wyniki. Ponad to widać pozytywną zależność od bogactwa społeczeństwa i edukacji. Ma to sens, ponieważ kraje bogate stać na edukowanie lekarzy, a brak problemów z żywieniem pozwala młodzieży na kształcenie. Negatywna zależność występuje najmocniej dla zachorowań na AIDS i niedożywienia wśród dzieci i młodzieży. Choroby typu polio i zapalenie wątroby typu B lub błonica mają mniejszy wpływ. Co ciekawe spożycie alkoholu w różnych krajach jest dodatnio skorelowane z przewidywaną długością życia. Rozsądek podpowiada, że spożywanie trucizn raczej przeciwdziała przeżywalności. Można to tłumaczyć w ten sposób, że jest również skorelowane ze wskaźnikami bogactwa społeczeństwa oraz przyczynami religijnymi i kulturowymi w biedniejszych krajach. 
+
+## Dane
+Wczytanie i podgląd danych
+```{r}
+data <- read.csv("Life_Expectancy_Data.csv")
+raw.data <- data
+```
+```{r, echo=FALSE}
+kable(head(data)[,c(1:8)], digits = 2)
+kable(head(data)[,c(9:17)], digits = 2)
+kable(head(data)[,c(18:22)], digits = 2)
+```
+
+Strutura zestawu danych
+```{r}
+str(data)
+```
+
+Przegląd podstawowych cech danych względem atrybutów:
+```{r}
+descr <- stat.desc(data, p=0.95)
+```
+```{r echo=FALSE}
+kable(descr[, c(1:8)], digits = 2)
+kable(descr[, c(9:17)], digits = 2)
+kable(descr[, c(18:22)], digits = 2)
+
+```
+
+W zbiorze występują zmiene tekstowe: Nazwa kraju oraz status. Drugi z nich zawiera tylko dwie wartości, więc można te wartości enumeruować w do analizy. 
+```{r}
+data$Status <- sapply(data$Status == "Developed", as.numeric)
+```
+
+Udział wierszy z NA w zbiorze jest wysoki. 
+```{r}
+nrow( data[complete.cases(data), ]) / nrow(data)
+```
+
+W związku z tym zbadano, dla jakich kolumn najczęściej występują wybrakowane dane oraz porównano je z korelacją między atrybutami.
+
+```{r missing_plot}
+corrupted_data <- data %>% 
+  summarise_all(list(~sum(is.na(.))/length(.))) %>%
+  gather(key="column", value="corrupted") %>%
+  filter(corrupted > 0) %>%
+  ggplot(aes(x=reorder(column, corrupted), y=corrupted)) +
+  geom_bar(stat="identity") +
+  coord_flip()
+
+corrupted_data
+```
+
+```{r}
+corr.data <- data[complete.cases(data),]
+numerics <- attributes(corr.data[unlist(lapply(corr.data, is.numeric))])$names
+cor_mat <- cor(corr.data[numerics])
+
+corrplot(cor_mat, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt=45, tl.cex=10/ncol(cor_mat))
+```
+Na podstawie powyższych wykresów widać, że najczęściej brakuje danych dotyczących populacji kraju. Ponieważ ta kolumna jest słabo skorelowana z pozostałymi kolumnami (śmiertelność wśród dzieci i noworodków jest wyrażona bezwzględnie, co tłumaczy zwiększoną korelację). Populacja nie będzie zatem brana pod uwagę podczas dalszej analizy. Kolumny "thinnes..." wykazują również bardzo wysoką korelację, bliską jedynki. Kolumna "thinnes.5.9.years" zostanie również usunięta jako zbędna. Kolumny "Percentage Expenditure" i "GDP" również są skorelowane, a danych na temat PKB brakuje w ponad 15% wierszy 
+
+```{r}
+data <- data[ , !(names(data) %in% c("Population", "thinness.5.9.years", "GDP") )]
+nrow( data[complete.cases(data), ]) / nrow(data)
+```
+
+Udział kompletnych wierszy w zbiorze wzrósł z ok. 56,1 % do 70,8%. 
+Dalszej analizie będą podlegać pozostałe kompletne przypadki.
+
+```{r}
+data <- data[complete.cases(data),]
+```
+
+## wykresy rozkładów wartości atrybutów
+```{r distributions, fig.width=10, fig.height=10}
+d <- melt(data[,-c(1:3)])
+ggplot(d,aes(x = value)) + 
+    facet_wrap(~variable, scales = "free", ncol=3, nrow=10) + 
+    geom_histogram(bins=50)
+```
+
+Mozna wyróżnić atrybuty o rozkladzie bliskim rozkładowi Pareta, np.: Percentage expenditure, Measles, Infant deaths. Dla innej grupy atrybutów, wartości przypominają przesunięty rozkład normalny. Najbardziej nieregularny jest BMI.
+
+## Oczekiwana długość życia w poszczególnych krajach
+```{r}
+ui <- fluidPage(
+  selectInput("country", "Select Country", unique(data$Country)),
+  plotOutput("expect")
+)
+
+server <- function(input, output, session) {
+  output$expect <- renderPlot({
+    country <- input$country
+    Expectancy <- data[ data$Country==country, ]$Life.expectancy
+    Year <- data[ data$Country==country, ]$Year
+    plot(Year, Expectancy)
+})
+}
+
+shinyApp(ui, server)
+
+```
+
+
+##Regresor przewidujący długość życia
+```{r}
+
+reg <- data[unlist(lapply(data, is.numeric))]
+preproc <- preProcess(reg, method=c("range"))
+reg.data <- predict(preproc, reg)
+
+test.set <- sample(1:nrow(reg.data), size=nrow(reg.data)/8, replace=FALSE)
+reg.data.test <- reg.data[ test.set, ]
+reg.data.train <- reg.data[ -test.set, ]
+
+sgd.train <- sgd(Life.expectancy ~ . , data=reg.data.train,
+               model="glm", model.control=binomial(link="logit"),
+               sgd.control=list(reltol=1e-5, npasses=200),
+                 lr.control=c(scale=1, gamma=1, alpha=30, c=1))
+
+sgd.test <- sgd(Life.expectancy ~ . , data=reg.data.test,
+               model="glm", model.control=binomial(link="logit"),
+               sgd.control=list(reltol=1e-5, npasses=200),
+                 lr.control=c(scale=1, gamma=1, alpha=30, c=1))
+
+r2.train <- summary(lm( sgd.train$fitted.values ~ reg.data.train[,3]))$r.squared
+r2.test <- summary(lm( sgd.test$fitted.values ~ reg.data.test[,3]))$r.squared
+
+M <- cbind(names(reg.data), sgd.test$coefficients)
+M[order(as.numeric(M[,2]), decreasing = TRUE), ]
+```
+
+```{r, echo=FALSE}
+sprintf("R^2 na zbiorze uczącym: %0.3f %%", 100* r2.train ) 
+sprintf("R^2 na zbiorze testowym: %0.3f %%", 100* r2.test )
+sprintf("RMSE na zbiorze uczącym: %0.3f %%", 100* RMSE(as.numeric(sgd.train$fitted.values), reg.data.train[,3])) 
+sprintf("RMSE na zbiorze testowym: %0.3f %%", 100* RMSE(as.numeric(sgd.test$fitted.values), reg.data.test[,3]))
+```
+
+
+
+
